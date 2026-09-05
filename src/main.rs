@@ -144,6 +144,19 @@ struct SavedSettings {
     api_key: String,
     #[serde(default)]
     api_key_dpapi: String,
+    #[serde(default)]
+    language: Option<String>,
+    #[serde(default, skip_serializing)]
+    english: Option<bool>,
+}
+
+fn normalized_language(settings: &SavedSettings) -> &'static str {
+    match settings.language.as_deref() {
+        Some("en") => "en",
+        Some("de") => "de",
+        _ if settings.english == Some(true) => "en",
+        _ => "de",
+    }
 }
 
 #[cfg(windows)]
@@ -310,7 +323,11 @@ fn load_saved_settings() -> SavedSettings {
     if !settings.api_key_dpapi.trim().is_empty() {
         settings.api_key = unprotect_api_key(&settings.api_key_dpapi).unwrap_or_default();
         if migrated_from_legacy && !settings.api_key.trim().is_empty() {
-            let _ = save_settings(&settings.server, &settings.api_key);
+            let _ = save_settings(
+                &settings.server,
+                &settings.api_key,
+                normalized_language(&settings),
+            );
         }
         return settings;
     }
@@ -329,13 +346,17 @@ fn load_saved_settings() -> SavedSettings {
     }
 
     if migrated_from_legacy && !settings.api_key.trim().is_empty() {
-        let _ = save_settings(&settings.server, &settings.api_key);
+        let _ = save_settings(
+            &settings.server,
+            &settings.api_key,
+            normalized_language(&settings),
+        );
     }
 
     settings
 }
 
-fn save_settings(server: &str, api_key: &str) -> Result<(), String> {
+fn save_settings(server: &str, api_key: &str, language: &str) -> Result<(), String> {
     let path = settings_path().ok_or_else(|| {
         if cfg!(windows) {
             "APPDATA-Ordner wurde nicht gefunden.".to_string()
@@ -353,6 +374,8 @@ fn save_settings(server: &str, api_key: &str) -> Result<(), String> {
         server: server.to_string(),
         api_key: String::new(),
         api_key_dpapi: protect_api_key(api_key)?,
+        language: Some(language.to_string()),
+        english: None,
     };
 
     #[cfg(not(windows))]
@@ -360,6 +383,8 @@ fn save_settings(server: &str, api_key: &str) -> Result<(), String> {
         server: server.to_string(),
         api_key: api_key.to_string(),
         api_key_dpapi: String::new(),
+        language: Some(language.to_string()),
+        english: None,
     };
 
     let json = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
@@ -450,6 +475,7 @@ struct ImmichApp {
 impl Default for ImmichApp {
     fn default() -> Self {
         let saved = load_saved_settings();
+        let english = normalized_language(&saved) == "en";
         let server = if saved.server.trim().is_empty() {
             String::new()
         } else {
@@ -510,7 +536,7 @@ impl Default for ImmichApp {
             conflict_remote_dims: None,
             info_popup: false,
             settings_popup: false,
-            english: false,
+            english,
             dark_mode: true,
         }
     }
@@ -2144,6 +2170,8 @@ impl ImmichApp {
                     .clicked()
                 {
                     self.english = !self.english;
+                    let language = if self.english { "en" } else { "de" };
+                    let _ = save_settings(&self.server, &self.api_key, language);
                 }
             });
     }
@@ -2707,7 +2735,8 @@ impl ImmichApp {
             match self.load_albums() {
                 Ok(()) => {
                     self.active_tab = ActiveTab::Albums;
-                    if let Err(e) = save_settings(&self.server, &self.api_key) {
+                    let language = if self.english { "en" } else { "de" };
+                    if let Err(e) = save_settings(&self.server, &self.api_key, language) {
                         self.status = if en {
                             format!("Connection successful, saving failed: {}", e)
                         } else {
