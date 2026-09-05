@@ -74,6 +74,7 @@ struct DownloadJob {
     folder_name: String,
     group_name: String,
     album_position: Option<(usize, usize)>,
+    output_file_name: String,
 }
 
 #[derive(Clone)]
@@ -1017,23 +1018,14 @@ impl ImmichApp {
         }
     }
 
-    fn duplicate_key(asset: &Asset) -> String {
-        if !asset.checksum.trim().is_empty() {
-            format!("checksum:{}", asset.checksum)
-        } else {
-            format!(
-                "fallback:{}|{}|{}",
-                Self::asset_file_name(asset).to_lowercase(),
-                asset.local_date_time,
-                asset.asset_type
-            )
-        }
-    }
-
     fn deduplicate_jobs(jobs: Vec<DownloadJob>) -> Vec<DownloadJob> {
         let mut best: HashMap<String, DownloadJob> = HashMap::new();
         for job in jobs {
-            let key = Self::duplicate_key(&job.asset);
+            let key = format!(
+                "{}|{}",
+                job.folder_name.to_lowercase(),
+                job.asset.id
+            );
             match best.get(&key) {
                 Some(existing)
                     if existing.asset.file_size_in_byte >= job.asset.file_size_in_byte => {}
@@ -1046,54 +1038,61 @@ impl ImmichApp {
     }
 
     fn deduplicate_queue_jobs(jobs: Vec<DownloadJob>) -> Vec<DownloadJob> {
-        // Technische Pflicht-Deduplizierung vor parallelen Downloads:
-        // 1) dieselbe Immich-Asset-ID darf nur einmal pro Zielpfad in die Queue
-        // 2) derselbe Zielpfad darf nur einmal gleichzeitig verarbeitet werden
-        // Dadurch kann ein Worker eine Datei nicht herunterladen, während ein
-        // anderer Worker dieselbe Datei kurz danach fälschlich als "vorhanden"
-        // erkennt.
-        let mut by_asset_and_path: HashMap<String, DownloadJob> = HashMap::new();
+        // Dieselbe Immich-Datei darf pro Zielordner nur einmal verarbeitet werden.
+        // Verschiedene Assets mit gleichem Originalnamen bleiben erhalten; ihre
+        // Zielnamen werden unten eindeutig gemacht.
+        let mut by_asset_and_folder: HashMap<String, DownloadJob> = HashMap::new();
 
         for job in jobs {
-            let file_name = Self::sanitize_file_name(&Self::asset_file_name(&job.asset));
-            let target_key = format!(
-                "{}\\{}",
+            let key = format!(
+                "{}|{}",
                 job.folder_name.to_lowercase(),
-                file_name.to_lowercase()
+                job.asset.id
             );
-            let key = format!("{}|{}", job.asset.id, target_key);
 
-            match by_asset_and_path.get(&key) {
+            match by_asset_and_folder.get(&key) {
                 Some(existing)
                     if existing.asset.file_size_in_byte >= job.asset.file_size_in_byte => {}
                 _ => {
-                    by_asset_and_path.insert(key, job);
+                    by_asset_and_folder.insert(key, job);
                 }
             }
         }
 
-        // Zweite Sicherung nur nach Zielpfad. Falls zwei verschiedene Asset-IDs
-        // auf exakt denselben Dateinamen im selben Ordner zeigen, bleibt die
-        // größere bekannte Version in der Queue.
-        let mut by_target_path: HashMap<String, DownloadJob> = HashMap::new();
-        for job in by_asset_and_path.into_values() {
-            let file_name = Self::sanitize_file_name(&Self::asset_file_name(&job.asset));
-            let target_key = format!(
-                "{}\\{}",
-                job.folder_name.to_lowercase(),
-                file_name.to_lowercase()
-            );
-
-            match by_target_path.get(&target_key) {
-                Some(existing)
-                    if existing.asset.file_size_in_byte >= job.asset.file_size_in_byte => {}
-                _ => {
-                    by_target_path.insert(target_key, job);
+        let mut used_paths = HashSet::new();
+        let mut result = Vec::new();
+        for mut job in by_asset_and_folder.into_values() {
+            let original_name = Self::sanitize_file_name(&Self::asset_file_name(&job.asset));
+            let (stem, extension) = match original_name.rsplit_once('.') {
+                Some((stem, extension)) if !stem.is_empty() && !extension.is_empty() => {
+                    (stem.to_string(), format!(".{}", extension))
                 }
+                _ => (original_name.clone(), String::new()),
+            };
+            let mut file_name = original_name;
+            let mut suffix = 0;
+            loop {
+                let path_key = format!(
+                    "{}\\{}",
+                    job.folder_name.to_lowercase(),
+                    file_name.to_lowercase()
+                );
+                if used_paths.insert(path_key) {
+                    break;
+                }
+                suffix += 1;
+                let extra = if suffix == 1 {
+                    job.asset.id.clone()
+                } else {
+                    format!("{}-{}", job.asset.id, suffix)
+                };
+                file_name = format!("{}_{}{}", stem, extra, extension);
             }
+            job.output_file_name = file_name;
+            result.push(job);
         }
 
-        by_target_path.into_values().collect()
+        result
     }
 
     fn format_bytes_i64(bytes: i64) -> String {
@@ -1172,6 +1171,43 @@ impl ImmichApp {
         }
 
         None
+    }
+
+    fn download_original_with_retries(
+        client: &Client,
+        base: &str,
+        api_key: &str,
+        asset_id: &str,
+        target_path: &Path,
+    ) -> Result<(), String> {
+        let url = format!("{}/api/assets/{}/original", base, asset_id);
+        let mut last_error = String::from("unbekannter Downloadfehler");
+
+        for attempt in 0..3 {
+            let result = client
+                .get(&url)
+                .header("x-api-key", api_key)
+                .send()
+                .and_then(|r| r.error_for_status());
+
+            match result {
+                Ok(mut response) => match fs::File::create(target_path) {
+                    Ok(mut file) => match response.copy_to(&mut file) {
+                        Ok(_) => return Ok(()),
+                        Err(error) => last_error = error.to_string(),
+                    },
+                    Err(error) => return Err(error.to_string()),
+                },
+                Err(error) => last_error = error.to_string(),
+            }
+
+            if attempt < 2 {
+                thread::sleep(Duration::from_millis(250 * (attempt + 1) as u64));
+            }
+        }
+
+        let _ = fs::remove_file(target_path);
+        Err(last_error)
     }
 
     fn selected_album_count(&self) -> usize {
@@ -1360,6 +1396,7 @@ impl ImmichApp {
                                 folder_name: Self::sanitize_file_name(&album.album_name),
                                 group_name: album.album_name.clone(),
                                 album_position: Some((album_index + 1, album_total)),
+                                output_file_name: String::new(),
                             });
                         }
                     }
@@ -1380,6 +1417,7 @@ impl ImmichApp {
                             folder_name: format!("Ohne Album\\{}", year),
                             group_name: format!("Ohne Album {}", year),
                             album_position: None,
+                            output_file_name: String::new(),
                         });
                     }
                 }
@@ -1393,6 +1431,7 @@ impl ImmichApp {
                             folder_name: format!("Alle Fotos nach Jahr\\{}", year),
                             group_name: format!("Alle Fotos {}", year),
                             album_position: None,
+                            output_file_name: String::new(),
                         });
                     }
                 }
@@ -1403,7 +1442,8 @@ impl ImmichApp {
             }
 
             // Unabhängig von der Benutzeroption muss die parallele Queue frei
-            // von doppelten Asset-/Zielpfad-Einträgen sein.
+            // von doppelten Asset-/Zielpfad-Einträgen sein. Unterschiedliche
+            // Assets mit gleichem Dateinamen erhalten dabei eindeutige Namen.
             jobs = Self::deduplicate_queue_jobs(jobs);
 
             if jobs.is_empty() {
@@ -1559,7 +1599,11 @@ impl ImmichApp {
                         break;
                     };
                     active.fetch_add(1, Ordering::Relaxed);
-                    let file_name = Self::asset_file_name(&job.asset);
+                    let file_name = if job.output_file_name.is_empty() {
+                        Self::asset_file_name(&job.asset)
+                    } else {
+                        job.output_file_name.clone()
+                    };
                     let folder = Path::new(&target_dir).join(&job.folder_name);
 
                     if let Err(e) = fs::create_dir_all(&folder) {
@@ -1595,36 +1639,20 @@ impl ImmichApp {
                                 skipped.fetch_add(1, Ordering::Relaxed);
                             }
                         } else if !cancel.load(Ordering::Relaxed) {
-                            let result = client
-                                .get(format!("{}/api/assets/{}/original", base, job.asset.id))
-                                .header("x-api-key", &api_key)
-                                .send()
-                                .and_then(|r| r.error_for_status());
-
-                            match result {
-                                Ok(mut response) => match fs::File::create(&target_path) {
-                                    Ok(mut file) => match response.copy_to(&mut file) {
-                                        Ok(_) => {
-                                            downloaded.fetch_add(1, Ordering::Relaxed);
-                                        }
-                                        Err(e) => {
-                                            failed.fetch_add(1, Ordering::Relaxed);
-                                            if let Ok(mut err) = errors.lock() {
-                                                err.push(format!("{} : {}", file_name, e));
-                                            }
-                                        }
-                                    },
-                                    Err(e) => {
-                                        failed.fetch_add(1, Ordering::Relaxed);
-                                        if let Ok(mut err) = errors.lock() {
-                                            err.push(format!("{} : {}", file_name, e));
-                                        }
-                                    }
-                                },
-                                Err(e) => {
+                            match Self::download_original_with_retries(
+                                &client,
+                                &base,
+                                &api_key,
+                                &job.asset.id,
+                                &target_path,
+                            ) {
+                                Ok(()) => {
+                                    downloaded.fetch_add(1, Ordering::Relaxed);
+                                }
+                                Err(error) => {
                                     failed.fetch_add(1, Ordering::Relaxed);
                                     if let Ok(mut err) = errors.lock() {
-                                        err.push(format!("{} : {}", file_name, e));
+                                        err.push(format!("{} : {}", file_name, error));
                                     }
                                 }
                             }
@@ -3269,9 +3297,11 @@ impl ImmichApp {
     fn conflict_target_path(&self, item: &ConflictItem) -> PathBuf {
         Path::new(&self.target_dir)
             .join(&item.job.folder_name)
-            .join(Self::sanitize_file_name(&Self::asset_file_name(
-                &item.job.asset,
-            )))
+            .join(if item.job.output_file_name.is_empty() {
+                Self::sanitize_file_name(&Self::asset_file_name(&item.job.asset))
+            } else {
+                item.job.output_file_name.clone()
+            })
     }
 
     fn texture_and_size_from_bytes(
@@ -3655,6 +3685,66 @@ impl ImmichApp {
                 };
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn job(asset_id: &str, folder_name: &str) -> DownloadJob {
+        DownloadJob {
+            asset: Asset {
+                id: asset_id.to_string(),
+                original_file_name: "photo.jpg".to_string(),
+                device_asset_id: String::new(),
+                asset_type: "IMAGE".to_string(),
+                checksum: "same-checksum".to_string(),
+                local_date_time: "2026-01-01T00:00:00Z".to_string(),
+                file_size_in_byte: 100,
+            },
+            folder_name: folder_name.to_string(),
+            group_name: folder_name.to_string(),
+            album_position: None,
+            output_file_name: String::new(),
+        }
+    }
+
+    #[test]
+    fn keeps_duplicate_asset_in_each_album_folder() {
+        let jobs = vec![job("asset-1", "Album A"), job("asset-1", "Album B")];
+
+        assert_eq!(ImmichApp::deduplicate_jobs(jobs).len(), 2);
+    }
+
+    #[test]
+    fn removes_duplicate_asset_within_one_album_folder() {
+        let jobs = vec![job("asset-1", "Album A"), job("asset-1", "Album A")];
+
+        assert_eq!(ImmichApp::deduplicate_jobs(jobs).len(), 1);
+    }
+
+    #[test]
+    fn keeps_distinct_assets_with_same_checksum() {
+        let mut first = job("asset-1", "Album A");
+        first.asset.checksum = "same-checksum".to_string();
+        let mut second = job("asset-2", "Album A");
+        second.asset.checksum = "same-checksum".to_string();
+
+        assert_eq!(ImmichApp::deduplicate_jobs(vec![first, second]).len(), 2);
+    }
+
+    #[test]
+    fn keeps_distinct_assets_with_same_original_filename() {
+        let mut first = job("asset-1", "Album A");
+        first.asset.checksum = "checksum-1".to_string();
+        let mut second = job("asset-2", "Album A");
+        second.asset.checksum = "checksum-2".to_string();
+
+        let jobs = ImmichApp::deduplicate_queue_jobs(vec![first, second]);
+
+        assert_eq!(jobs.len(), 2);
+        assert_ne!(jobs[0].output_file_name, jobs[1].output_file_name);
     }
 }
 
