@@ -248,6 +248,7 @@ fn unprotect_api_key(_encoded: &str) -> Result<String, String> {
     Err("DPAPI decryption is only available on Windows.".to_string())
 }
 
+#[cfg(windows)]
 fn settings_path() -> Option<PathBuf> {
     let appdata = std::env::var_os("APPDATA")?;
     Some(
@@ -257,6 +258,21 @@ fn settings_path() -> Option<PathBuf> {
     )
 }
 
+#[cfg(not(windows))]
+fn settings_path() -> Option<PathBuf> {
+    let config_dir = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
+
+    Some(
+        config_dir
+            .join("Media_Backup_Manager")
+            .join("settings.json"),
+    )
+}
+
+#[cfg(windows)]
 fn legacy_settings_path() -> Option<PathBuf> {
     let appdata = std::env::var_os("APPDATA")?;
     Some(
@@ -264,6 +280,11 @@ fn legacy_settings_path() -> Option<PathBuf> {
             .join("Immich_Backup_Manager")
             .join("settings.json"),
     )
+}
+
+#[cfg(not(windows))]
+fn legacy_settings_path() -> Option<PathBuf> {
+    None
 }
 
 fn load_saved_settings() -> SavedSettings {
@@ -315,20 +336,43 @@ fn load_saved_settings() -> SavedSettings {
 }
 
 fn save_settings(server: &str, api_key: &str) -> Result<(), String> {
-    let path = settings_path().ok_or_else(|| "APPDATA-Ordner wurde nicht gefunden.".to_string())?;
+    let path = settings_path().ok_or_else(|| {
+        if cfg!(windows) {
+            "APPDATA-Ordner wurde nicht gefunden.".to_string()
+        } else {
+            "Linux-Konfigurationsordner konnte nicht bestimmt werden.".to_string()
+        }
+    })?;
 
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
 
+    #[cfg(windows)]
     let settings = SavedSettings {
         server: server.to_string(),
         api_key: String::new(),
         api_key_dpapi: protect_api_key(api_key)?,
     };
 
+    #[cfg(not(windows))]
+    let settings = SavedSettings {
+        server: server.to_string(),
+        api_key: api_key.to_string(),
+        api_key_dpapi: String::new(),
+    };
+
     let json = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
-    fs::write(path, json).map_err(|e| e.to_string())
+    fs::write(&path, json).map_err(|e| e.to_string())?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).map_err(|e| e.to_string())?;
+    }
+
+    Ok(())
 }
 
 fn delete_saved_settings() -> Result<(), String> {
