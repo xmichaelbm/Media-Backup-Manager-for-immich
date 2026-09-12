@@ -22,6 +22,8 @@
 
 The project is provided free of charge and is not commercially operated by its maintainer. The GPL itself does not prohibit commercial use.
 
+This fork also includes a tested Ubuntu/Linux build and a local desktop-shortcut installer. The original application and release documentation are Windows-focused.
+
 ---
 
 ## Program preview / Programmvorschau
@@ -135,6 +137,32 @@ Media Backup Manager.exe
 
 Release verification status for 1.6.8 is documented in `VERIFICATION_1.6.8.md`.
 
+## Build on Ubuntu/Linux
+
+Requirements: a current stable Rust toolchain and the committed `Cargo.lock`.
+
+```bash
+cargo fmt --check
+cargo check --locked
+cargo test --locked
+cargo build --release --locked
+```
+
+The release binary is created at `target/release/media_backup_manager`. The
+release profile strips debugging symbols. To build the binary and create an
+executable desktop shortcut, run:
+
+```bash
+./install-desktop-shortcut.sh
+```
+
+The shortcut is placed in the configured desktop directory, normally
+`~/Desktop`. Ubuntu may require right-clicking the launcher and choosing
+**Allow Launching**.
+
+On Linux, the API key is not encrypted with Windows DPAPI. Settings are stored
+at `${XDG_CONFIG_HOME:-~/.config}/Media_Backup_Manager/settings.json`.
+
 ## Source code
 
 Repository:
@@ -243,6 +271,33 @@ Media Backup Manager.exe
 ```
 
 Der Prüfstatus für Version 1.6.8 ist in `VERIFICATION_1.6.8.md` dokumentiert.
+
+## Build unter Ubuntu/Linux
+
+Voraussetzungen: aktuelle stabile Rust-Toolchain und die mitgelieferte `Cargo.lock`.
+
+```bash
+cargo fmt --check
+cargo check --locked
+cargo test --locked
+cargo build --release --locked
+```
+
+Die Release-Binärdatei wird unter `target/release/media_backup_manager` erstellt.
+Das Release-Profil entfernt Debug-Symbole. Zum Erstellen der Binärdatei und einer
+ausführbaren Desktop-Verknüpfung:
+
+```bash
+./install-desktop-shortcut.sh
+```
+
+Die Verknüpfung wird im konfigurierten Desktop-Ordner abgelegt, normalerweise
+unter `~/Desktop`. Unter Ubuntu muss möglicherweise per Rechtsklick **Starten
+erlauben** ausgewählt werden.
+
+Unter Linux wird der API-Schlüssel nicht mit Windows DPAPI verschlüsselt. Die
+Einstellungen werden unter `${XDG_CONFIG_HOME:-~/.config}/Media_Backup_Manager/settings.json`
+gespeichert.
 
 ## Quellcode
 
